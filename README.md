@@ -6,9 +6,13 @@ and reads screenshots to decide the next command.
 ## Setup (uv default)
 
 ```bash
-cd /home/jemo/projects/Mishpat
+git clone https://github.com/Jemo69/mishpat.git ~/projects/Mishpat
+cd ~/projects/Mishpat
 uv sync
 cp .env.example .env   # only needed for `agent` mode
+# optional global shim (~/.local/bin/mishpat):
+#   #!/bin/sh
+#   exec uv run --project /home/jemo/projects/Mishpat /home/jemo/projects/Mishpat/main.py "$@"
 ```
 
 Requires: Chromium + chromedriver (already at `/usr/bin/chromium`, `/usr/bin/chromedriver`).
