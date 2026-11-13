@@ -6,7 +6,6 @@ dom console tabs tab screenshot assert
 """
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from browser import HeadlessBrowser
@@ -64,7 +63,7 @@ def do_step(b: HeadlessBrowser, s: dict[str, Any]) -> dict[str, Any]:
     if a == "scroll":
         return b.scroll(int(s.get("pixels", 800)))
     if a == "wait":
-        time.sleep(float(s.get("seconds", 2)))
+        b.sleep(float(s.get("seconds", 2)))  # active use: reaper must not kill a scripted wait
         return {"ok": True, "waited": s.get("seconds", 2)}
     if a == "wait_for":
         return b.wait_for(s["condition"], float(s.get("timeout", 15)))

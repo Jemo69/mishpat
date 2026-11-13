@@ -60,11 +60,13 @@ Script format (`tests/demo.json`) — same verbs in `run`, `record`, `shell`, `h
   {"action": "tabs"}
 ]
 ```
-Verbs: `goto snapshot click click_text type press scroll wait wait_for wait_idle js back forward reload dom console tabs tab checkpoint restore screenshot assert`.
+Verbs: `goto snapshot click click_text type press scroll wait wait_for wait_idle js back forward reload dom console tabs tab checkpoint restore screenshot assert idle`.
 
 Agent accelerators: `js <expr>` (set localStorage tokens, read state — skips the 60s UI login), `checkpoint <file>` / `--restore` (resume logged-in sessions), `wait_for <js>` + `wait_idle` (conditions over blind sleeps; `wait_idle` after `goto` guards pre-hydration native submits), `click [N]` (snapshot refs beat hostile CSS), `--quiet` (paths only, parseable stdout), `--driver-port N` (parallel-run isolation), `ASSERT_PASS/FAIL` tokens, `DRIVER_LOST` + exit 2 on driver death.
 
-REPL extras: `dom raw` (unwrapped HTML for grep), `tab <n>` (jump tabs — clicks auto-follow `_blank`), `console` (JS errors in-terminal). Shots are session-prefixed (`shot-MMDD-HHMMSS-001.png`) so runs never overwrite each other. Typing hidden inputs fails loudly; stale-element races retry once; errors are one-liners.
+REPL extras: `dom raw` (unwrapped HTML for grep), `tab <n>` (jump tabs — clicks auto-follow `_blank`), `console` (JS errors in-terminal), `idle` (idle/auto-close countdown). Shots are session-prefixed (`shot-MMDD-HHMMSS-001.png`) so runs never overwrite each other. Typing hidden inputs fails loudly; stale-element races retry once; errors are one-liners.
+
+Idle reaper: Chromium quits after 60s with no calls (`--idle-timeout N`, `0` = never) so abandoned REPL/MCP sessions never leak a headless browser; the next call relaunches transparently. An explicit `wait` counts as active use and never gets reaped.
 
 ## Give the agent browser-use with no visible window
 
@@ -92,7 +94,7 @@ Manual OpenCode snippet (already applied above):
 }
 ```
 
-Tools exposed: `browser_goto, browser_snapshot, browser_click, browser_type, browser_screenshot, browser_dom, browser_assert, browser_back`.
+Tools exposed: `browser_goto, browser_snapshot, browser_click, browser_type, browser_screenshot, browser_dom, browser_assert, browser_back, browser_idle, browser_quit`.
 All run headless (`--headless=new`); screenshots land in `shots/` for the agent to read.
 
 ## Where else to get this (public options)
