@@ -32,10 +32,11 @@ def _browser(
     height: int,
     quiet: bool = False,
     driver_port: int = 0,
+    idle_timeout: float = 60.0,
 ) -> HeadlessBrowser:
     return HeadlessBrowser(
         headless=headless, shots_dir=shots_dir, width=width, height=height,
-        quiet=quiet, driver_port=driver_port,
+        quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout,
     )
 
 
@@ -47,6 +48,7 @@ def shell(
     quiet: bool = typer.Option(False, help="Paths only, no base64 noise (parseable stdout)"),
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
     restore: str = typer.Option(None, help="Checkpoint file to restore (skips UI login)"),
+    idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
 ) -> None:
     """Interactive REPL. The agent (or human) types commands; every step prints a screenshot path.
 
@@ -58,7 +60,7 @@ def shell(
         mishpat> assert "IANA"
     """
     b = _browser(headless=not headed, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port)
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
     rprint(f"[bold green]Mishpat headless shell[/]  headless={not headed}  shots=./{shots_dir}/")
     rprint("[dim]Type `help` for commands. `quit` closes the browser.[/]")
     rprint(b.start(url))
@@ -75,7 +77,7 @@ def shell(
         cmd, args = parts[0].lower(), parts[1:]
         try:
             if cmd in ("help", "h"):
-                rprint("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | back | forward | reload | tabs | tab <n> | dom [raw] | console | checkpoint <file> | restore <file> | screenshot | assert <text> | quit")
+                rprint("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | back | forward | reload | tabs | tab <n> | dom [raw] | console | checkpoint <file> | restore <file> | screenshot | assert <text> | idle | quit")
             elif cmd == "goto" and args:
                 rprint(b.goto(args[0]))
                 rprint(b.screenshot())
@@ -107,8 +109,7 @@ def shell(
             elif cmd == "reload":
                 rprint(b.reload()); rprint(b.screenshot())
             elif cmd == "wait" and args:
-                import time as _t
-                _t.sleep(float(args[0]))
+                b.sleep(float(args[0]))  # explicit wait = active use; reaper must not kill it
                 rprint(f"waited {args[0]}s"); rprint(b.screenshot())
             elif cmd == "js":
                 # raw remainder: shlex would eat the quotes JS string literals need
@@ -155,6 +156,8 @@ def shell(
                 rprint(f"{'ASSERT_PASS' if r['ok'] else 'ASSERT_FAIL'}: {r}")
             elif cmd == "url":
                 rprint(b.snapshot()["url"])
+            elif cmd == "idle":
+                rprint(b.idle_status())
             elif cmd in ("quit", "exit", "q"):
                 rprint(b.quit())
                 break
@@ -178,7 +181,8 @@ def screenshot(
     height: int = typer.Option(900),
 ) -> None:
     """One-shot headless screenshot (no REPL)."""
-    b = _browser(headless=not headed, shots_dir=str(Path(out).parent), width=width, height=height)
+    b = _browser(headless=not headed, shots_dir=str(Path(out).parent), width=width, height=height,
+                  idle_timeout=0)
     b.start(url)
     rprint(b.screenshot(out))
     b.quit()
@@ -192,11 +196,12 @@ def run(
     quiet: bool = typer.Option(False, help="Paths only, no base64 noise"),
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
     restore: str = typer.Option(None, help="Checkpoint file to restore (skips UI login)"),
+    idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
 ) -> None:
     """Run a repeatable scripted test. Each step auto-screenshots. Stops on first failure (exit 1); driver death exits 2."""
     steps: list[dict] = json.loads(Path(script).read_text())
     b = _browser(headless=not headed, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port)
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
     b.start()
     if restore:
         rprint(b.restore(restore))
@@ -249,11 +254,12 @@ def record(
     shots_dir: str = typer.Option("shots"),
     quiet: bool = typer.Option(True, help="Paths only in output (default on for record)"),
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
+    idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
 ) -> None:
     """Record a test run to MP4 (local ffmpeg, free). Scripted or auto-scroll tour."""
     import json as _json
     b = _browser(headless=not headed, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port)
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
     b.start(url)
     frames: list[str] = [b.screenshot()["path"]]
     if script:
@@ -283,6 +289,7 @@ def helpful(
     shots_dir: str = typer.Option("shots"),
     quiet: bool = typer.Option(False, help="Paths only, no base64 noise"),
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
+    idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
 ) -> None:
     """Helpful mode: VISIBLE browser + guided REPL + every step recorded to MP4.
 
@@ -291,9 +298,9 @@ def helpful(
     MP4 of the run is stitched on quit. All local — no paid recording service.
     """
     b = _browser(headless=False, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port)
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
     rprint("[bold green]Mishpat helpful mode[/]  visible browser, recording every step")
-    rprint(f"[dim]Drive the page, then `quit` stitches {video_out}. Commands: goto/click/type/press/scroll/back/reload/snapshot/screenshot/assert/url/quit[/]")
+    rprint(f"[dim]Drive the page, then `quit` stitches {video_out}. Commands: goto/click/type/press/scroll/back/reload/snapshot/screenshot/assert/url/idle/quit[/]")
     rprint(b.start(url))
     frames: list[str] = [b.screenshot()["path"]]
     while True:
@@ -307,7 +314,7 @@ def helpful(
         cmd, args = parts[0].lower(), parts[1:]
         try:
             if cmd in ("help", "h"):
-                rprint("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | back | forward | reload | tabs | tab <n> | dom [raw] | console | checkpoint <file> | restore <file> | screenshot | assert <text> | quit")
+                rprint("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | back | forward | reload | tabs | tab <n> | dom [raw] | console | checkpoint <file> | restore <file> | screenshot | assert <text> | idle | quit")
             elif cmd == "goto" and args:
                 rprint(b.goto(args[0])); frames.append(b.screenshot()["path"])
             elif cmd == "snapshot":
@@ -324,8 +331,7 @@ def helpful(
             elif cmd == "scroll":
                 rprint(b.scroll(int(args[0]) if args else 800)); frames.append(b.screenshot()["path"])
             elif cmd == "wait" and args:
-                import time as _t
-                _t.sleep(float(args[0]))
+                b.sleep(float(args[0]))  # explicit wait = active use; reaper must not kill it
                 rprint(f"waited {args[0]}s"); frames.append(b.screenshot()["path"])
             elif cmd == "js":
                 rprint(b.js(line.split(None, 1)[1] if " " in line else "true"))
@@ -370,6 +376,8 @@ def helpful(
                 rprint(f"{'ASSERT_PASS' if r['ok'] else 'ASSERT_FAIL'}: {r}")
             elif cmd == "url":
                 rprint(b.snapshot()["url"])
+            elif cmd == "idle":
+                rprint(b.idle_status())
             elif cmd in ("quit", "exit", "q"):
                 rprint(b.quit())
                 break
@@ -386,12 +394,14 @@ def helpful(
 
 
 @app.command()
-def mcp() -> None:
+def mcp(
+    idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never). Next tool call relaunches."),
+) -> None:
     """Serve headless Selenium as an MCP server (stdio) — browser-use for agents, no visible window."""
     from fastmcp import FastMCP
 
     server = FastMCP("mishpat-headless")
-    browser = HeadlessBrowser(headless=True)
+    browser = HeadlessBrowser(headless=True, idle_timeout=idle_timeout)
 
     @server.tool
     def browser_goto(url: str) -> dict:
@@ -472,8 +482,23 @@ def mcp() -> None:
         out["screenshot"] = browser.screenshot()["path"]
         return out
 
-    browser.start()
-    server.run()
+    @server.tool
+    def browser_idle() -> dict:
+        """Idle state: is Chromium alive, how long idle, auto-close timeout."""
+        return browser.idle_status()
+
+    @server.tool
+    def browser_quit() -> dict:
+        """Force-close Chromium now (frees RAM). Next tool call relaunches transparently."""
+        return browser.quit()
+
+    try:
+        browser.start()  # inside the try: a launch that raises after spawn is cleaned too
+        server.run()
+    finally:
+        # EOF/crash must not orphan chromedriver+chromium (the reaper dies with
+        # this process, so exit is the last chance to free them).
+        browser.quit()
 
 
 if __name__ == "__main__":

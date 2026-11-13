@@ -48,8 +48,7 @@ def _exec(browser: HeadlessBrowser, call: dict[str, Any]) -> dict[str, Any]:
     elif action == "scroll":
         result = browser.scroll(int(call.get("pixels", 800)))
     elif action == "wait":
-        import time as _t
-        _t.sleep(float(call.get("seconds", 5)))
+        browser.sleep(float(call.get("seconds", 5)))  # active use: reaper must not kill a plan wait
         result = {"ok": True, "waited": call.get("seconds", 5)}
     elif action == "js":
         result = browser.js(str(call.get("expression", "document.readyState")))
