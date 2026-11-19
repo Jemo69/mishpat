@@ -49,6 +49,62 @@ _S = TypeVar("_S", bound="HeadlessBrowser")
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
+# Mobile presets: CSS viewport + DPR + UA + touch. The agent "sees" the site
+# as a phone by screenshotting under one of these (device <name>).
+DEVICES: dict[str, dict[str, Any]] = {
+    "iphone-15-pro": {
+        "label": "iPhone 15 Pro", "width": 393, "height": 852, "dpr": 3.0,
+        "mobile": True, "touch": True,
+        "ua": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
+               "Mobile/15E148 Safari/604.1"),
+    },
+    "iphone-se": {
+        "label": "iPhone SE", "width": 375, "height": 667, "dpr": 2.0,
+        "mobile": True, "touch": True,
+        "ua": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
+               "Mobile/15E148 Safari/604.1"),
+    },
+    "pixel-8": {
+        "label": "Pixel 8", "width": 412, "height": 915, "dpr": 2.625,
+        "mobile": True, "touch": True,
+        "ua": ("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"),
+    },
+    "ipad-air": {
+        "label": "iPad Air", "width": 820, "height": 1180, "dpr": 2.0,
+        "mobile": True, "touch": True,
+        "ua": ("Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
+               "Mobile/15E148 Safari/604.1"),
+    },
+    # Desktop presets carry an explicit UA too: switching back from a phone
+    # must overwrite the mobile UA override (CDP has no "clear", only "set").
+    "desktop": {
+        "label": "Desktop", "width": 1280, "height": 900, "dpr": 1.0,
+        "mobile": False, "touch": False,
+        "ua": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+    },
+    "desktop-hd": {
+        "label": "Desktop HD", "width": 1920, "height": 1080, "dpr": 1.0,
+        "mobile": False, "touch": False,
+        "ua": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+    },
+}
+
+# CDP Network.emulateNetworkConditions presets (throughput in bytes/sec).
+# "online" resets to unthrottled. Values mirror DevTools' mobile presets.
+NETWORK_PRESETS: dict[str, dict[str, Any]] = {
+    "offline": {"offline": True, "latency": 0, "download": 0, "upload": 0},
+    "slow-3g": {"offline": False, "latency": 2000, "download": 50 * 1024, "upload": 50 * 1024},
+    "fast-3g": {"offline": False, "latency": 150, "download": 200 * 1024, "upload": 96 * 1024},
+    "4g": {"offline": False, "latency": 20, "download": 512 * 1024, "upload": 384 * 1024},
+    "online": {"offline": False, "latency": 0, "download": -1, "upload": -1},
+}
+
 
 def _held(fn: Callable[Concatenate[_S, _P], _R]) -> Callable[Concatenate[_S, _P], _R]:
     """Run a whole driver operation under the idle-reaper lock.
@@ -80,10 +136,29 @@ class HeadlessBrowser:
         quiet: bool = False,
         driver_port: int = 0,
         idle_timeout: float = 60.0,
+        device: str | None = None,
     ) -> None:
         self.headless = headless
-        self.width = width
-        self.height = height
+        # A device preset overrides width/height with its CSS viewport.
+        if device is not None and device not in DEVICES:
+            raise ValueError(f"unknown device: {device!r} (try: {', '.join(DEVICES)})")
+        name = device or "desktop"
+        preset = DEVICES[name]
+        self.width = preset["width"] if device else width
+        self.height = preset["height"] if device else height
+        # Live emulation state (CDP override); viewport()/rotate() mutate this.
+        self._emulation: dict[str, Any] = {
+            "device": name,
+            "width": self.width,
+            "height": self.height,
+            "dpr": preset["dpr"],
+            "mobile": preset["mobile"],
+            "touch": preset["touch"],
+            "ua": preset["ua"],
+        }
+        # DevTools state that must survive an idle-reaper relaunch (C2).
+        self._throttle = "online"
+        self._theme: str = "none"
         self.shots_dir = Path(shots_dir)
         self.shots_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
@@ -207,7 +282,9 @@ class HeadlessBrowser:
             # can D-Bus-activate xfce4-notifyd, which pops "Unable to start notification
             # daemon" on the Windows side. Headless browsing needs no notifications.
             opts.add_argument("--disable-notifications")
-            opts.set_capability("goog:loggingPrefs", {"browser": "ALL"})  # feeds console()
+            # browser log feeds console(); performance log feeds network().
+            opts.set_capability("goog:loggingPrefs", {"browser": "ALL", "performance": "ALL"})
+            opts.add_experimental_option("perfLoggingPrefs", {"enableNetwork": True})
             # Steering away from automation banners breaks fewer sites than you'd think.
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             env = dict(os.environ)
@@ -218,6 +295,8 @@ class HeadlessBrowser:
             self.driver = webdriver.Chrome(options=opts, service=service)
             self.driver.set_page_load_timeout(self.timeout)
             self.driver.implicitly_wait(3)
+            self._apply_emulation()  # device preset before first navigation
+            self._apply_net_state()  # reapply stored throttle/theme after relaunch
             self._touch()
             self._start_reaper()
         if url:
@@ -259,6 +338,227 @@ class HeadlessBrowser:
             "viewport": {"width": self.width, "height": self.height},
             "elements": elements,
         }
+
+    # ---- mobile emulation + devtools (CDP) ----
+
+    def _apply_emulation(self) -> None:
+        """Push self._emulation to Chromium via CDP. Call with the lock held."""
+        d = self.driver
+        if d is None:
+            return
+        e = self._emulation
+        try:
+            d.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+                "width": e["width"], "height": e["height"],
+                "deviceScaleFactor": e["dpr"], "mobile": e["mobile"],
+            })
+        except Exception:
+            pass  # older drivers: window-size arg still applies
+        try:
+            d.execute_cdp_cmd("Emulation.setTouchEmulationEnabled", {"enabled": e["touch"]})
+        except Exception:
+            pass
+        # Always set (never skip): every preset carries a UA so switching
+        # back to desktop overwrites a stale mobile UA (C1).
+        try:
+            d.execute_cdp_cmd("Emulation.setUserAgentOverride", {"userAgent": e["ua"]})
+        except Exception:
+            pass
+
+    def _apply_net_state(self) -> None:
+        """Reapply stored throttle/theme to a fresh driver. Lock held. Best-effort:
+        a relaunch must never fail because a CDP nicety did."""
+        d = self.driver
+        if d is None:
+            return
+        p = NETWORK_PRESETS.get(self._throttle, NETWORK_PRESETS["online"])
+        try:
+            d.execute_cdp_cmd("Network.enable", {})
+            d.execute_cdp_cmd("Network.emulateNetworkConditions", {
+                "offline": p["offline"], "latency": p["latency"],
+                "downloadThroughput": p["download"], "uploadThroughput": p["upload"],
+            })
+        except Exception:
+            pass
+        if self._theme != "none":
+            try:
+                d.execute_cdp_cmd("Emulation.setEmulatedMedia", {
+                    "features": [{"name": "prefers-color-scheme", "value": self._theme}]})
+            except Exception:
+                pass
+
+    @_held
+    def emulate(
+        self,
+        device: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> dict[str, Any]:
+        """See the site as a mobile device: viewport + DPR + touch + mobile UA.
+
+        emulate("pixel-8") switches preset; width/height override just the dims
+        (keeps the current preset's touch/UA). emulate("desktop") resets.
+        Bare emulate() lists the presets (no browser launch needed)."""
+        if device is None and width is None and height is None:
+            return {
+                "ok": True,
+                "current": dict(self._emulation),
+                "devices": {
+                    name: {k: p[k] for k in ("label", "width", "height", "dpr", "mobile", "touch")}
+                    for name, p in DEVICES.items()
+                },
+            }
+        d = self._require()
+        if device is not None:
+            if device not in DEVICES:
+                raise ValueError(f"unknown device: {device!r} (try: {', '.join(DEVICES)})")
+            p = DEVICES[device]
+            self._emulation.update({
+                "device": device, "width": p["width"], "height": p["height"],
+                "dpr": p["dpr"], "mobile": p["mobile"],
+                "touch": p["touch"], "ua": p["ua"],
+            })
+        if width is not None:
+            self._emulation["width"] = int(width)
+        if height is not None:
+            self._emulation["height"] = int(height)
+        self._emulation["device"] = device or self._emulation["device"]
+        self.width, self.height = self._emulation["width"], self._emulation["height"]
+        try:
+            # Window resize first: it can clear a CDP metrics override, so the
+            # override below must be the last writer.
+            d.set_window_size(self.width, self.height)
+        except Exception:
+            pass
+        self._apply_emulation()
+        return {"ok": True, "emulation": dict(self._emulation), "url": d.current_url}
+
+    @_held
+    def viewport(self, width: int, height: int) -> dict[str, Any]:
+        """Resize the CSS viewport (keeps current device's touch/UA)."""
+        return self.emulate(width=int(width), height=int(height))
+
+    @_held
+    def rotate(self) -> dict[str, Any]:
+        """Swap portrait/landscape (mobile orientation check)."""
+        d = self._require()
+        w, h = d.execute_script("return [window.innerWidth, window.innerHeight];")
+        return self.emulate(width=int(h), height=int(w))
+
+    @_held
+    def network(self, limit: int = 30) -> dict[str, Any]:
+        """DevTools Network in the terminal: recent requests with status.
+
+        Failures (4xx/5xx/loadingFailed) surface first so the agent spots
+        broken APIs without opening DevTools."""
+        d = self._require()
+        reqs: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        try:
+            logs = d.get_log("performance")
+        except Exception as exc:
+            logs = []
+            log_error = f"performance log unavailable: {exc}"
+        else:
+            log_error = ""
+        import json as _json
+        for entry in logs:
+            try:
+                msg = _json.loads(entry.get("message", "{}")).get("message", {})
+            except Exception:
+                continue
+            method, p = msg.get("method", ""), msg.get("params", {})
+            if method == "Network.requestWillBeSent":
+                rid = p.get("requestId", "")
+                url = p.get("request", {}).get("url", "")[:160]
+                if rid and rid not in reqs:
+                    reqs[rid] = {"url": url,
+                                 "status": None, "mime": "", "failed": False, "error": ""}
+                    order.append(rid)
+                elif rid and url:
+                    # Redirect hop reuses the requestId: follow it to the final URL.
+                    reqs[rid]["url"] = url
+            elif method == "Network.responseReceived":
+                rid = p.get("requestId", "")
+                if rid in reqs:
+                    resp = p.get("response", {})
+                    reqs[rid]["status"] = resp.get("status")
+                    reqs[rid]["mime"] = str(resp.get("mimeType", ""))[:60]
+                    if isinstance(resp.get("status"), int) and resp["status"] >= 400:
+                        reqs[rid]["failed"] = True
+            elif method == "Network.loadingFailed":
+                rid = p.get("requestId", "")
+                if rid in reqs:
+                    reqs[rid]["failed"] = True
+                    reqs[rid]["error"] = str(p.get("errorText", ""))[:120]
+        # data: noise out. Failures first (the agent's signal), then most recent.
+        items = [reqs[rid] for rid in order
+                 if reqs[rid]["url"] and not reqs[rid]["url"].startswith("data:")]
+        failed = [r for r in items if r["failed"]]
+        ok_items = [r for r in items if not r["failed"]]
+        return {
+            "ok": True, "url": d.current_url,
+            "total": len(items), "failed_count": len(failed),
+            "failed": failed[:limit],
+            "recent": (failed + ok_items[-max(0, limit - len(failed)):])[:limit],
+            **({"log_error": log_error} if log_error else {}),
+        }
+
+    @_held
+    def perf(self) -> dict[str, Any]:
+        """DevTools Performance in one dict: navigation + paint timing."""
+        d = self._require()
+        timing = d.execute_script(
+            "const n = performance.getEntriesByType('navigation')[0] || {};"
+            "const paint = Object.fromEntries(performance.getEntriesByType('paint')"
+            ".map(e => [e.name, Math.round(e.startTime)]));"
+            "return {"
+            "  domContentLoaded: Math.round(n.domContentLoadedEventEnd || 0),"
+            "  load: Math.round(n.loadEventEnd || 0),"
+            "  domInteractive: Math.round(n.domInteractive || 0),"
+            "  transferBytes: n.transferSize || 0,"
+            "  resources: performance.getEntriesByType('resource').length,"
+            "  firstPaint: paint['first-paint'] ?? null,"
+            "  firstContentfulPaint: paint['first-contentful-paint'] ?? null};"
+        )
+        return {"ok": True, "url": d.current_url, **timing}
+
+    @_held
+    def throttle(self, preset: str = "online") -> dict[str, Any]:
+        """DevTools throttling: offline | slow-3g | fast-3g | 4g | online.
+
+        throttle("offline") then goto proves the app's offline story."""
+        d = self._require()
+        if preset not in NETWORK_PRESETS:
+            raise ValueError(f"unknown preset: {preset!r} (try: {', '.join(NETWORK_PRESETS)})")
+        p = NETWORK_PRESETS[preset]
+        try:
+            d.execute_cdp_cmd("Network.enable", {})
+        except Exception:
+            pass
+        try:
+            d.execute_cdp_cmd("Network.emulateNetworkConditions", {
+                "offline": p["offline"], "latency": p["latency"],
+                "downloadThroughput": p["download"], "uploadThroughput": p["upload"],
+            })
+        except Exception as exc:
+            raise RuntimeError(f"throttle {preset!r} failed: {short_exc(exc)}")
+        self._throttle = preset  # relaunches reapply it (C2)
+        return {"ok": True, "throttle": preset, **p}
+
+    @_held
+    def theme(self, mode: str = "dark") -> dict[str, Any]:
+        """Emulate prefers-color-scheme: dark | light | none (clears override)."""
+        d = self._require()
+        if mode not in ("dark", "light", "none"):
+            raise ValueError(f"unknown theme: {mode!r} (try: dark | light | none)")
+        features = [] if mode == "none" else [{"name": "prefers-color-scheme", "value": mode}]
+        try:
+            d.execute_cdp_cmd("Emulation.setEmulatedMedia", {"features": features})
+        except Exception as exc:
+            raise RuntimeError(f"theme {mode!r} failed: {short_exc(exc)}")
+        self._theme = mode  # relaunches reapply it (C2)
+        return {"ok": True, "theme": mode}
 
     def _retry_once(self, fn: Callable[[], Any]) -> Any:
         """Run fn; on a stale-element race (SPA re-rendered mid-action), retry once."""

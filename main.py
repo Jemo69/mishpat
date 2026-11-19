@@ -5,16 +5,159 @@ import json
 import shlex
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from dotenv import load_dotenv
 from rich import print as rprint
 
 from agent import run_agent
-from browser import HeadlessBrowser
+from browser import DEVICES, HeadlessBrowser
 from steps import ACTIONS, DRIVER_LOST, do_step, is_driver_dead, short_error
 from video import stitch_frames
+
+REPL_HELP = ("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | "
+             "js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | "
+             "back | forward | reload | tabs | tab <n> | dom [raw] | console | network [n] | perf | "
+             "device [name] | viewport <w> <h> | rotate | throttle <preset> | theme <dark|light|none> | "
+             "checkpoint <file> | restore <file> | screenshot | assert <text> | idle | quit")
+
+
+def _repl_step(b: HeadlessBrowser, cmd: str, args: list[str], line: str) -> dict[str, Any]:
+    """Run one REPL command. Shared by shell + helpful so the two loops can't drift.
+
+    Returns {"text": printable, "shots": [screenshot dicts]} or {"quit": True, "text": ...}
+    or {"unknown": True}. Screenshots happen here; the caller prints text and
+    files shots (helpful appends them to its MP4 frames)."""
+    shots: list[dict[str, Any]] = []
+
+    def _shoot() -> None:
+        shots.append(b.screenshot())
+
+    if cmd in ("help", "h"):
+        return {"text": REPL_HELP, "shots": shots}
+    if cmd in ("quit", "exit", "q"):
+        return {"quit": True, "text": b.quit()}
+    if cmd == "goto" and args:
+        out = b.goto(args[0]); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "snapshot":
+        snap = b.snapshot()
+        lines = [f"{snap['title']}  {snap['url']} ({len(snap['elements'])} elements)"]
+        lines += [f"  [{el['ref']}] {el['tag']} {el['selector']!r}  {el['text']!r}"
+                  for el in snap["elements"][:30]]
+        return {"text": "\n".join(lines), "shots": shots}
+    if cmd == "click" and args:
+        out = b.click(args[0]); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "click_text" and args:
+        out = b.click_text(" ".join(args)); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "type" and len(args) >= 2:
+        out = b.type_text(args[0], " ".join(args[1:])); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "press":
+        out = b.press(args[0] if args else "ENTER"); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "scroll":
+        out = b.scroll(int(args[0]) if args else 800); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "back":
+        out = b.back(); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "forward":
+        out = b.forward(); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "reload":
+        out = b.reload(); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "wait" and args:
+        b.sleep(float(args[0]))  # explicit wait = active use; reaper must not kill it
+        _shoot()
+        return {"text": f"waited {args[0]}s", "shots": shots}
+    if cmd == "js":
+        # raw remainder: shlex would eat the quotes JS string literals need
+        return {"text": b.js(line.split(None, 1)[1] if " " in line else "true"), "shots": shots}
+    if cmd == "wait_for" and args:
+        raw = line.split(None, 1)[1]
+        head, _, tail = raw.rpartition(" ")
+        if head and tail.replace(".", "", 1).isdigit():
+            expr, timeout = head, float(tail)
+        else:
+            expr, timeout = raw, 15.0
+        out = b.wait_for(expr, timeout); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "wait_idle":
+        return {"text": b.wait_idle(float(args[0]) if args else 20.0), "shots": shots}
+    if cmd == "checkpoint" and args:
+        return {"text": b.checkpoint(args[0]), "shots": shots}
+    if cmd == "restore" and args:
+        return {"text": b.restore(args[0]), "shots": shots}
+    if cmd == "dom":
+        limit = 8000
+        raw = False
+        for a in args:
+            if a.isdigit():
+                limit = int(a)
+            if a == "raw":
+                raw = True
+        d = b.dom(limit=limit)
+        if raw:
+            print(d["html"])  # plain print: no wrapping, safe to pipe to grep
+            return {"text": f"[{d['length']} chars, printed raw above]", "shots": shots}
+        return {"text": f"[{d['length']} chars]\n{d['html'][:3000]}", "shots": shots}
+    if cmd == "console":
+        lines = [f"[{e['level']}] {e['message'][:300]}" for e in b.console()["entries"]]
+        return {"text": "\n".join(lines) or "(no console entries)", "shots": shots}
+    if cmd == "network":
+        n = b.network(limit=int(args[0]) if args and args[0].isdigit() else 30)
+        lines = [f"{n['total']} requests, {n['failed_count']} failed"]
+        for r in (n["failed"] + n["recent"]):
+            mark = "FAIL" if r["failed"] else "ok"
+            lines.append(f"  {mark} {r['status']} {r['url'][:110]} {r.get('error', '')}")
+        return {"text": "\n".join(lines), "shots": shots}
+    if cmd == "perf":
+        out = b.perf(); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "device":
+        if not args:  # bare `device` lists presets (no browser launch needed)
+            devs = b.emulate()
+            lines = [f"current: {devs['current']}"]
+            lines += [f"  {name}: {p['label']} {p['width']}x{p['height']} "
+                        f"dpr={p['dpr']} mobile={p['mobile']}"
+                        for name, p in devs["devices"].items()]
+            return {"text": "\n".join(lines), "shots": shots}
+        out = b.emulate(args[0]); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "viewport" and len(args) >= 2:
+        out = b.viewport(int(args[0]), int(args[1])); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "rotate":
+        out = b.rotate(); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "throttle" and args:
+        out = b.throttle(args[0]); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "theme" and args:
+        out = b.theme(args[0]); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "tabs":
+        return {"text": b.tabs(), "shots": shots}
+    if cmd == "tab" and args:
+        out = b.switch_tab(int(args[0])); _shoot()
+        return {"text": out, "shots": shots}
+    if cmd == "screenshot":
+        shot = b.screenshot(args[0] if args else None)
+        shots.append(shot)
+        return {"text": "", "shots": shots}  # shot travels via shots only (no double-print)
+    if cmd == "assert" and args:
+        r = b.assert_text(" ".join(args))
+        return {"text": f"{'ASSERT_PASS' if r['ok'] else 'ASSERT_FAIL'}: {r}", "shots": shots}
+    if cmd == "url":
+        return {"text": b.snapshot()["url"], "shots": shots}
+    if cmd == "idle":
+        return {"text": b.idle_status(), "shots": shots}
+    return {"unknown": True}
 
 load_dotenv()
 
@@ -33,10 +176,14 @@ def _browser(
     quiet: bool = False,
     driver_port: int = 0,
     idle_timeout: float = 60.0,
+    device: str | None = None,
 ) -> HeadlessBrowser:
+    if device is not None and device not in DEVICES:
+        raise typer.BadParameter(f"unknown device: {device!r} (try: {', '.join(DEVICES)})")
     return HeadlessBrowser(
         headless=headless, shots_dir=shots_dir, width=width, height=height,
         quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout,
+        device=device,
     )
 
 
@@ -49,6 +196,7 @@ def shell(
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
     restore: str = typer.Option(None, help="Checkpoint file to restore (skips UI login)"),
     idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
+    device: str = typer.Option(None, help="Start emulating a mobile device (iphone-15-pro, iphone-se, pixel-8, ipad-air, desktop-hd)"),
 ) -> None:
     """Interactive REPL. The agent (or human) types commands; every step prints a screenshot path.
 
@@ -60,8 +208,9 @@ def shell(
         mishpat> assert "IANA"
     """
     b = _browser(headless=not headed, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
-    rprint(f"[bold green]Mishpat headless shell[/]  headless={not headed}  shots=./{shots_dir}/")
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout,
+                  device=device)
+    rprint(f"[bold green]Mishpat headless shell[/]  headless={not headed}  shots=./{shots_dir}/" + (f"  device={device}" if device else ""))
     rprint("[dim]Type `help` for commands. `quit` closes the browser.[/]")
     rprint(b.start(url))
     if restore:
@@ -76,93 +225,16 @@ def shell(
         parts = shlex.split(line)
         cmd, args = parts[0].lower(), parts[1:]
         try:
-            if cmd in ("help", "h"):
-                rprint("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | back | forward | reload | tabs | tab <n> | dom [raw] | console | checkpoint <file> | restore <file> | screenshot | assert <text> | idle | quit")
-            elif cmd == "goto" and args:
-                rprint(b.goto(args[0]))
-                rprint(b.screenshot())
-            elif cmd == "snapshot":
-                snap = b.snapshot()
-                rprint(f"[bold]{snap['title']}[/]  {snap['url']}")
-                for el in snap["elements"][:30]:
-                    rprint(f"  [{el['ref']}] {el['tag']} {el['selector']!r}  {el['text']!r}")
-                rprint(f"[dim]{len(snap['elements'])} interactive elements[/]")
-            elif cmd == "click" and args:
-                rprint(b.click(args[0]))
-                rprint(b.screenshot())
-            elif cmd == "click_text" and args:
-                rprint(b.click_text(" ".join(args)))
-                rprint(b.screenshot())
-            elif cmd == "type" and len(args) >= 2:
-                rprint(b.type_text(args[0], " ".join(args[1:])))
-                rprint(b.screenshot())
-            elif cmd == "press":
-                rprint(b.press(args[0] if args else "ENTER"))
-                rprint(b.screenshot())
-            elif cmd == "scroll":
-                rprint(b.scroll(int(args[0]) if args else 800))
-                rprint(b.screenshot())
-            elif cmd == "back":
-                rprint(b.back()); rprint(b.screenshot())
-            elif cmd == "forward":
-                rprint(b.forward()); rprint(b.screenshot())
-            elif cmd == "reload":
-                rprint(b.reload()); rprint(b.screenshot())
-            elif cmd == "wait" and args:
-                b.sleep(float(args[0]))  # explicit wait = active use; reaper must not kill it
-                rprint(f"waited {args[0]}s"); rprint(b.screenshot())
-            elif cmd == "js":
-                # raw remainder: shlex would eat the quotes JS string literals need
-                rprint(b.js(line.split(None, 1)[1] if " " in line else "true"))
-            elif cmd == "wait_for" and args:
-                raw = line.split(None, 1)[1]
-                head, _, tail = raw.rpartition(" ")
-                if head and tail.replace(".", "", 1).isdigit():
-                    expr, timeout = head, float(tail)
-                else:
-                    expr, timeout = raw, 15.0
-                rprint(b.wait_for(expr, timeout))
-            elif cmd == "wait_idle":
-                rprint(b.wait_idle(float(args[0]) if args else 20.0))
-            elif cmd == "checkpoint" and args:
-                rprint(b.checkpoint(args[0]))
-            elif cmd == "restore" and args:
-                rprint(b.restore(args[0]))
-            elif cmd == "dom":
-                limit = 8000
-                raw = False
-                for a in args:
-                    if a.isdigit():
-                        limit = int(a)
-                    if a == "raw":
-                        raw = True
-                d = b.dom(limit=limit)
-                if raw:
-                    print(d["html"])  # plain print: no wrapping, safe to pipe to grep
-                else:
-                    rprint(f"[dim]{d['length']} chars[/]\n{d['html'][:3000]}")
-            elif cmd == "console":
-                for e in b.console()["entries"]:
-                    rprint(f"[{e['level']}] {e['message'][:300]}")
-            elif cmd == "tabs":
-                rprint(b.tabs())
-            elif cmd == "tab" and args:
-                rprint(b.switch_tab(int(args[0])))
-                rprint(b.screenshot())
-            elif cmd == "screenshot":
-                rprint(b.screenshot(args[0] if args else None))
-            elif cmd == "assert" and args:
-                r = b.assert_text(" ".join(args))
-                rprint(f"{'ASSERT_PASS' if r['ok'] else 'ASSERT_FAIL'}: {r}")
-            elif cmd == "url":
-                rprint(b.snapshot()["url"])
-            elif cmd == "idle":
-                rprint(b.idle_status())
-            elif cmd in ("quit", "exit", "q"):
-                rprint(b.quit())
+            out = _repl_step(b, cmd, args, line)
+            if out.get("quit"):
+                rprint(out["text"])
                 break
-            else:
+            if out.get("unknown"):
                 rprint(f"[red]Unknown or incomplete command:[/] {line}  (try `help`)")
+            else:
+                rprint(out["text"])
+                for shot in out["shots"]:
+                    rprint(shot)
             sys.stdout.flush()
         except Exception as exc:
             if is_driver_dead(exc):
@@ -179,10 +251,11 @@ def screenshot(
     headed: bool = typer.Option(False, help="Show browser instead of headless"),
     width: int = typer.Option(1280),
     height: int = typer.Option(900),
+    device: str = typer.Option(None, help="Emulate a mobile device (iphone-15-pro, iphone-se, pixel-8, ipad-air, desktop-hd)"),
 ) -> None:
     """One-shot headless screenshot (no REPL)."""
     b = _browser(headless=not headed, shots_dir=str(Path(out).parent), width=width, height=height,
-                  idle_timeout=0)
+                  idle_timeout=0, device=device)
     b.start(url)
     rprint(b.screenshot(out))
     b.quit()
@@ -197,11 +270,13 @@ def run(
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
     restore: str = typer.Option(None, help="Checkpoint file to restore (skips UI login)"),
     idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
+    device: str = typer.Option(None, help="Start emulating a mobile device (iphone-15-pro, iphone-se, pixel-8, ipad-air, desktop-hd)"),
 ) -> None:
     """Run a repeatable scripted test. Each step auto-screenshots. Stops on first failure (exit 1); driver death exits 2."""
     steps: list[dict] = json.loads(Path(script).read_text())
     b = _browser(headless=not headed, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout,
+                  device=device)
     b.start()
     if restore:
         rprint(b.restore(restore))
@@ -255,11 +330,13 @@ def record(
     quiet: bool = typer.Option(True, help="Paths only in output (default on for record)"),
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
     idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
+    device: str = typer.Option(None, help="Record with a mobile device emulated (iphone-15-pro, iphone-se, pixel-8, ipad-air)"),
 ) -> None:
     """Record a test run to MP4 (local ffmpeg, free). Scripted or auto-scroll tour."""
     import json as _json
     b = _browser(headless=not headed, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout,
+                  device=device)
     b.start(url)
     frames: list[str] = [b.screenshot()["path"]]
     if script:
@@ -290,6 +367,7 @@ def helpful(
     quiet: bool = typer.Option(False, help="Paths only, no base64 noise"),
     driver_port: int = typer.Option(0, help="Chromedriver port; set to isolate parallel runs"),
     idle_timeout: float = typer.Option(60.0, help="Quit Chromium after N s idle (0=never)"),
+    device: str = typer.Option(None, help="Start emulating a mobile device (iphone-15-pro, iphone-se, pixel-8, ipad-air)"),
 ) -> None:
     """Helpful mode: VISIBLE browser + guided REPL + every step recorded to MP4.
 
@@ -298,9 +376,10 @@ def helpful(
     MP4 of the run is stitched on quit. All local — no paid recording service.
     """
     b = _browser(headless=False, shots_dir=shots_dir, width=1280, height=900,
-                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout)
-    rprint("[bold green]Mishpat helpful mode[/]  visible browser, recording every step")
-    rprint(f"[dim]Drive the page, then `quit` stitches {video_out}. Commands: goto/click/type/press/scroll/back/reload/snapshot/screenshot/assert/url/idle/quit[/]")
+                  quiet=quiet, driver_port=driver_port, idle_timeout=idle_timeout,
+                  device=device)
+    rprint("[bold green]Mishpat helpful mode[/]  visible browser, recording every step" + (f"  device={device}" if device else ""))
+    rprint(f"[dim]Drive the page, then `quit` stitches {video_out}. Commands: goto/click/type/press/scroll/back/reload/snapshot/screenshot/assert/url/idle/device/viewport/rotate/network/perf/throttle/theme/quit[/]")
     rprint(b.start(url))
     frames: list[str] = [b.screenshot()["path"]]
     while True:
@@ -313,76 +392,16 @@ def helpful(
         parts = shlex.split(line)
         cmd, args = parts[0].lower(), parts[1:]
         try:
-            if cmd in ("help", "h"):
-                rprint("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | back | forward | reload | tabs | tab <n> | dom [raw] | console | checkpoint <file> | restore <file> | screenshot | assert <text> | idle | quit")
-            elif cmd == "goto" and args:
-                rprint(b.goto(args[0])); frames.append(b.screenshot()["path"])
-            elif cmd == "snapshot":
-                snap = b.snapshot()
-                rprint(f"[bold]{snap['title']}[/]  {snap['url']}  ({len(snap['elements'])} elements)")
-            elif cmd == "click" and args:
-                rprint(b.click(args[0])); frames.append(b.screenshot()["path"])
-            elif cmd == "click_text" and args:
-                rprint(b.click_text(" ".join(args))); frames.append(b.screenshot()["path"])
-            elif cmd == "type" and len(args) >= 2:
-                rprint(b.type_text(args[0], " ".join(args[1:]))); frames.append(b.screenshot()["path"])
-            elif cmd == "press":
-                rprint(b.press(args[0] if args else "ENTER")); frames.append(b.screenshot()["path"])
-            elif cmd == "scroll":
-                rprint(b.scroll(int(args[0]) if args else 800)); frames.append(b.screenshot()["path"])
-            elif cmd == "wait" and args:
-                b.sleep(float(args[0]))  # explicit wait = active use; reaper must not kill it
-                rprint(f"waited {args[0]}s"); frames.append(b.screenshot()["path"])
-            elif cmd == "js":
-                rprint(b.js(line.split(None, 1)[1] if " " in line else "true"))
-            elif cmd == "wait_for" and args:
-                raw = line.split(None, 1)[1]
-                head, _, tail = raw.rpartition(" ")
-                if head and tail.replace(".", "", 1).isdigit():
-                    expr, timeout = head, float(tail)
-                else:
-                    expr, timeout = raw, 15.0
-                rprint(b.wait_for(expr, timeout)); frames.append(b.screenshot()["path"])
-            elif cmd == "wait_idle":
-                rprint(b.wait_idle(float(args[0]) if args else 20.0))
-            elif cmd == "checkpoint" and args:
-                rprint(b.checkpoint(args[0]))
-            elif cmd == "restore" and args:
-                rprint(b.restore(args[0]))
-            elif cmd == "back":
-                rprint(b.back()); frames.append(b.screenshot()["path"])
-            elif cmd == "forward":
-                rprint(b.forward()); frames.append(b.screenshot()["path"])
-            elif cmd == "reload":
-                rprint(b.reload()); frames.append(b.screenshot()["path"])
-            elif cmd == "tabs":
-                rprint(b.tabs())
-            elif cmd == "tab" and args:
-                rprint(b.switch_tab(int(args[0]))); frames.append(b.screenshot()["path"])
-            elif cmd == "dom":
-                d = b.dom()
-                if "raw" in args:
-                    print(d["html"])
-                else:
-                    rprint(f"[dim]{d['length']} chars[/]\n{d['html'][:3000]}")
-            elif cmd == "console":
-                for e in b.console()["entries"]:
-                    rprint(f"[{e['level']}] {e['message'][:300]}")
-            elif cmd == "screenshot":
-                shot = b.screenshot(args[0] if args else None)
-                rprint(shot); frames.append(shot["path"])
-            elif cmd == "assert" and args:
-                r = b.assert_text(" ".join(args))
-                rprint(f"{'ASSERT_PASS' if r['ok'] else 'ASSERT_FAIL'}: {r}")
-            elif cmd == "url":
-                rprint(b.snapshot()["url"])
-            elif cmd == "idle":
-                rprint(b.idle_status())
-            elif cmd in ("quit", "exit", "q"):
-                rprint(b.quit())
+            out = _repl_step(b, cmd, args, line)
+            if out.get("quit"):
+                rprint(out["text"])
                 break
-            else:
+            if out.get("unknown"):
                 rprint(f"[red]Unknown:[/] {line}")
+            else:
+                rprint(out["text"])
+                for shot in out["shots"]:
+                    frames.append(shot["path"])
             sys.stdout.flush()
         except Exception as exc:
             if is_driver_dead(exc):
@@ -479,6 +498,50 @@ def mcp(
     def browser_wait_idle(timeout: float = 20) -> dict:
         """Wait for hydration to settle (ready + DOM quiet). Call after goto before clicking."""
         out = browser.wait_idle(timeout)
+        out["screenshot"] = browser.screenshot()["path"]
+        return out
+
+    @server.tool
+    def browser_device(device: str = "") -> dict:
+        """See the site as a mobile device (iphone-15-pro, iphone-se, pixel-8, ipad-air, desktop, desktop-hd). Viewport + touch + mobile UA. Empty string lists presets."""
+        out = browser.emulate(device or None)
+        if "devices" not in out:  # a switch took effect: show it
+            out["screenshot"] = browser.screenshot()["path"]
+        return out
+
+    @server.tool
+    def browser_viewport(width: int, height: int) -> dict:
+        """Resize the CSS viewport (keeps current device touch/UA)."""
+        out = browser.viewport(width, height)
+        out["screenshot"] = browser.screenshot()["path"]
+        return out
+
+    @server.tool
+    def browser_rotate() -> dict:
+        """Swap portrait/landscape (mobile orientation check)."""
+        out = browser.rotate()
+        out["screenshot"] = browser.screenshot()["path"]
+        return out
+
+    @server.tool
+    def browser_network(limit: int = 30) -> dict:
+        """DevTools Network: recent requests with status; failures surface first."""
+        return browser.network(limit=limit)
+
+    @server.tool
+    def browser_perf() -> dict:
+        """DevTools Performance: navigation + paint timing for the current page."""
+        return browser.perf()
+
+    @server.tool
+    def browser_throttle(preset: str) -> dict:
+        """DevTools throttling: offline | slow-3g | fast-3g | 4g | online."""
+        return browser.throttle(preset)
+
+    @server.tool
+    def browser_theme(mode: str) -> dict:
+        """Emulate prefers-color-scheme: dark | light | none."""
+        out = browser.theme(mode)
         out["screenshot"] = browser.screenshot()["path"]
         return out
 

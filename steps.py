@@ -1,8 +1,9 @@
 """One action language for shell, helpful, run, record, and the agent loop.
 
 Every command speaks the same verbs so agents never re-learn per mode:
-goto snapshot click click_text type press scroll wait back forward reload
-dom console tabs tab screenshot assert
+goto snapshot click click_text type press scroll wait wait_for wait_idle
+back forward reload dom console network perf tabs tab js checkpoint restore
+screenshot assert device viewport rotate throttle theme
 """
 from __future__ import annotations
 
@@ -12,8 +13,41 @@ from browser import HeadlessBrowser
 
 ACTIONS = (
     "goto snapshot click click_text type press scroll wait wait_for wait_idle "
-    "back forward reload dom console tabs tab js checkpoint restore screenshot assert"
+    "back forward reload dom console network perf tabs tab js checkpoint restore screenshot assert "
+    "device viewport rotate throttle theme"
 )
+
+
+def normalize(s: dict[str, Any]) -> dict[str, Any]:
+    """One arg language for scripts + agent: accept text/WxH or explicit keys.
+
+    Scripts use explicit keys (device/preset/mode/width/height); the agent
+    loop favors a single `text` field and "WxH" viewports. Both land here."""
+    s = dict(s)
+    a = s.get("action", "")
+    t = s.get("text", "")
+    s.setdefault("text", "")
+    if a == "goto":
+        s.setdefault("url", t)
+    elif a == "press":
+        s.setdefault("key", t or "ENTER")
+    elif a == "device":
+        s.setdefault("device", s.get("name") or t or None)
+    elif a == "viewport" and "width" not in s and t:
+        parts = str(t).lower().replace("x", " ").split()
+        if len(parts) == 2 and all(p.isdigit() for p in parts):
+            s["width"], s["height"] = parts
+    elif a == "throttle":
+        s.setdefault("preset", t or "online")
+    elif a == "theme":
+        s.setdefault("mode", t or "dark")
+    elif a == "js":
+        s.setdefault("expression", t or "document.readyState")
+    elif a == "wait_for":
+        s.setdefault("condition", "true")
+    elif a == "tab":
+        s.setdefault("index", 0)
+    return s
 
 # Signatures that the chromedriver connection itself is gone (crash/OOM-kill).
 # When these appear, the session is unrecoverable: abort, don't keep feeding stdin.
@@ -49,6 +83,7 @@ def is_driver_dead(exc: Exception) -> bool:
 
 def do_step(b: HeadlessBrowser, s: dict[str, Any]) -> dict[str, Any]:
     """Execute one action dict. Raises LookupError/RuntimeError on failure."""
+    s = normalize(s)
     a = s.get("action", "")
     if a == "goto":
         return b.goto(s["url"])
@@ -98,4 +133,18 @@ def do_step(b: HeadlessBrowser, s: dict[str, Any]) -> dict[str, Any]:
         return r
     if a == "snapshot":
         return b.snapshot()
+    if a == "device":
+        return b.emulate(s.get("device"), s.get("width"), s.get("height"))
+    if a == "viewport":
+        return b.viewport(int(s["width"]), int(s["height"]))
+    if a == "rotate":
+        return b.rotate()
+    if a == "network":
+        return b.network(limit=int(s.get("limit", 30)))
+    if a == "perf":
+        return b.perf()
+    if a == "throttle":
+        return b.throttle(str(s.get("preset", s.get("text", "online"))))
+    if a == "theme":
+        return b.theme(str(s.get("mode", s.get("text", "dark"))))
     raise ValueError(f"unknown action: {a} (valid: {ACTIONS})")
