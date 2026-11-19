@@ -5,7 +5,7 @@ import json
 import shlex
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from dotenv import load_dotenv
@@ -15,7 +15,6 @@ from agent import run_agent
 from browser import DEVICES, HeadlessBrowser
 from steps import ACTIONS, DRIVER_LOST, do_step, is_driver_dead, short_error
 from video import stitch_frames
-from typing import Any
 
 REPL_HELP = ("goto <url> | snapshot | click <sel|[N]> | click_text <text> | type <sel> <text> | "
              "js <expr> | wait <secs> | wait_for <js> [timeout] | wait_idle | press [KEY] | scroll [px] | "
@@ -150,7 +149,7 @@ def _repl_step(b: HeadlessBrowser, cmd: str, args: list[str], line: str) -> dict
     if cmd == "screenshot":
         shot = b.screenshot(args[0] if args else None)
         shots.append(shot)
-        return {"text": shot, "shots": shots}
+        return {"text": "", "shots": shots}  # shot travels via shots only (no double-print)
     if cmd == "assert" and args:
         r = b.assert_text(" ".join(args))
         return {"text": f"{'ASSERT_PASS' if r['ok'] else 'ASSERT_FAIL'}: {r}", "shots": shots}

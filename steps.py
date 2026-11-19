@@ -42,7 +42,7 @@ def normalize(s: dict[str, Any]) -> dict[str, Any]:
     elif a == "theme":
         s.setdefault("mode", t or "dark")
     elif a == "js":
-        s.setdefault("expression", "document.readyState")
+        s.setdefault("expression", t or "document.readyState")
     elif a == "wait_for":
         s.setdefault("condition", "true")
     elif a == "tab":

@@ -9,7 +9,7 @@ import httpx
 from dotenv import load_dotenv
 
 from browser import HeadlessBrowser
-from steps import do_step, normalize, short_error
+from steps import do_step, short_error
 
 load_dotenv()
 
@@ -34,7 +34,7 @@ def _chat(base_url: str, api_key: str, model: str, messages: list[dict[str, str]
 
 
 def _exec(browser: HeadlessBrowser, call: dict[str, Any]) -> dict[str, Any]:
-    # Same verbs as scripts: normalize agent-style args (text/WxH), then delegate.
+    # Same verbs as scripts (do_step normalizes agent-style text/WxH args), then delegate.
     action = str(call.get("action", "snapshot")).lower()
     if action == "done":
         return {"done": True, "note": str(call.get("note", ""))}
@@ -47,7 +47,7 @@ def _exec(browser: HeadlessBrowser, call: dict[str, Any]) -> dict[str, Any]:
         result = browser.dom()
         result["html"] = result["html"][:2000]  # keep context small for the LLM
     else:
-        result = do_step(browser, normalize({**call, "action": action}))
+        result = do_step(browser, {**call, "action": action})  # do_step owns normalize()
     # Every step ends with a fresh screenshot so the agent "sees" the page.
     try:
         shot = browser.screenshot()
