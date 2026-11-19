@@ -9,17 +9,17 @@ import httpx
 from dotenv import load_dotenv
 
 from browser import HeadlessBrowser
-from steps import short_error
+from steps import do_step, normalize, short_error
 
 load_dotenv()
 
 SYSTEM_PROMPT = """You test web pages with headless Selenium. On each step reply with ONE JSON tool call:
-{"action": "goto"|"snapshot"|"click"|"click_text"|"type"|"press"|"scroll"|"wait"|"wait_for"|"wait_idle"|"js"|"back"|"reload"|"dom"|"console"|"network"|"perf"|"device"|"devices"|"viewport"|"rotate"|"throttle"|"theme"|"tabs"|"tab"|"screenshot"|"assert"|"done",
- "selector": "<css, for click/type>", "text": "<text/url/needle>", "pixels": 800, "seconds": 5, "index": 0, "note": "<what you learned>"}
+{"action": "goto"|"snapshot"|"click"|"click_text"|"type"|"press"|"scroll"|"wait"|"wait_for"|"wait_idle"|"js"|"back"|"reload"|"dom"|"console"|"network"|"perf"|"device"|"viewport"|"rotate"|"throttle"|"theme"|"tabs"|"tab"|"screenshot"|"assert"|"done",
+ "selector": "<css, for click/type>", "text": "<text/url/needle/device-name/WxH>", "pixels": 800, "seconds": 5, "index": 0, "note": "<what you learned>"}
 Rules: prefer snapshot before click/type (use real selectors from snapshot). click_text clicks by visible words when selectors repeat. Clicks auto-follow _blank links into new tabs (check tabs). reads console for JS errors after key actions. network shows failed requests (check after page loads); perf gives load timing. device "pixel-8" (or iphone-15-pro) sees the site as a phone, rotate checks orientation, viewport resizes; throttle "offline"/"slow-3g" tests degraded networks. waits for slow pages. Use screenshot to verify visually. End with {"action":"done","note":"<verdict PASS/FAIL + summary>"}.
 """
 
-TOOLS_HELP = "goto(url) snapshot click(selector) click_text(words) type(selector,text) press(key) scroll(pixels) wait(seconds) wait_for(js-cond) wait_idle js(expr) back reload dom console network perf device(name) viewport(w,h) rotate throttle(preset) theme(mode) tabs tab(index) screenshot assert(needle) done"
+TOOLS_HELP = "goto(url) snapshot click(selector) click_text(words) type(selector,text) press(key) scroll(pixels) wait(seconds) wait_for(js-cond) wait_idle js(expr) back reload dom console network perf device(name, no-arg lists presets) viewport(WxH) rotate throttle(preset) theme(mode) tabs tab(index) screenshot assert(needle) done"
 
 
 def _chat(base_url: str, api_key: str, model: str, messages: list[dict[str, str]]) -> str:
@@ -34,75 +34,26 @@ def _chat(base_url: str, api_key: str, model: str, messages: list[dict[str, str]
 
 
 def _exec(browser: HeadlessBrowser, call: dict[str, Any]) -> dict[str, Any]:
+    # Same verbs as scripts: normalize agent-style args (text/WxH), then delegate.
     action = str(call.get("action", "snapshot")).lower()
-    if action == "goto":
-        result = browser.goto(str(call.get("text", "")))
-    elif action == "click":
-        result = browser.click(str(call.get("selector", "")))
-    elif action == "click_text":
-        result = browser.click_text(str(call.get("text", "")))
-    elif action == "type":
-        result = browser.type_text(str(call.get("selector", "")), str(call.get("text", "")))
-    elif action == "press":
-        result = browser.press(str(call.get("text", "ENTER")))
-    elif action == "scroll":
-        result = browser.scroll(int(call.get("pixels", 800)))
-    elif action == "wait":
-        browser.sleep(float(call.get("seconds", 5)))  # active use: reaper must not kill a plan wait
-        result = {"ok": True, "waited": call.get("seconds", 5)}
-    elif action == "js":
-        result = browser.js(str(call.get("expression", "document.readyState")))
-    elif action == "wait_for":
-        result = browser.wait_for(str(call.get("condition", "true")), float(call.get("timeout", 15)))
-    elif action == "wait_idle":
-        result = browser.wait_idle(float(call.get("timeout", 20)))
-    elif action == "back":
-        result = browser.back()
-    elif action == "reload":
-        result = browser.reload()
-    elif action == "dom":
-        result = browser.dom()
-        result["html"] = result["html"][:2000]  # keep context small for the LLM
-    elif action == "console":
-        result = browser.console()
-    elif action == "network":
-        result = browser.network()
-    elif action == "perf":
-        result = browser.perf()
-    elif action == "device":
-        result = browser.emulate(str(call.get("text", call.get("device", "pixel-8"))))
-    elif action == "devices":
-        result = browser.devices()
-    elif action == "viewport":
-        w, h = str(call.get("text", "1280x900")).lower().replace("x", " ").split()
-        result = browser.viewport(int(w), int(h))
-    elif action == "rotate":
-        result = browser.rotate()
-    elif action == "throttle":
-        result = browser.throttle(str(call.get("text", call.get("preset", "online"))))
-    elif action == "theme":
-        result = browser.theme(str(call.get("text", call.get("mode", "dark"))))
-    elif action == "tabs":
-        result = browser.tabs()
-    elif action == "tab":
-        result = browser.switch_tab(int(call.get("index", 0)))
-    elif action == "assert":
-        result = browser.assert_text(str(call.get("text", "")))
-    elif action == "screenshot":
+    if action == "done":
+        return {"done": True, "note": str(call.get("note", ""))}
+    if action == "screenshot":
         result = {"ok": True, "snapshot": browser.snapshot()}
         shot = browser.screenshot()
         result["screenshot_path"] = shot["path"]
-    elif action == "done":
-        return {"done": True, "note": str(call.get("note", ""))}
-    else:  # snapshot default
-        result = browser.snapshot()
+        return result
+    if action == "dom":
+        result = browser.dom()
+        result["html"] = result["html"][:2000]  # keep context small for the LLM
+    else:
+        result = do_step(browser, normalize({**call, "action": action}))
     # Every step ends with a fresh screenshot so the agent "sees" the page.
-    if action not in ("screenshot", "done"):
-        try:
-            shot = browser.screenshot()
-            result["screenshot_path"] = shot["path"]
-        except Exception:
-            pass
+    try:
+        shot = browser.screenshot()
+        result["screenshot_path"] = shot["path"]
+    except Exception:
+        pass
     return result
 
 

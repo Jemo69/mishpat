@@ -4,7 +4,10 @@
   {"action": "perf"},
   {"action": "console"},
   {"action": "throttle", "preset": "slow-3g"},
+  {"action": "throttle", "preset": "offline"},
+  {"action": "wait_for", "condition": "navigator.onLine===false"},
   {"action": "throttle", "preset": "online"},
+  {"action": "wait_for", "condition": "navigator.onLine===true"},
   {"action": "theme", "mode": "dark"},
   {"action": "theme", "mode": "none"}
 ]

@@ -1,11 +1,15 @@
 [
-  {"action": "devices"},
+  {"action": "device"},
   {"action": "device", "device": "pixel-8"},
   {"action": "goto", "url": "https://example.com"},
+  {"action": "wait_for", "condition": "window.innerWidth===412"},
+  {"action": "wait_for", "condition": "navigator.userAgent.includes('Pixel')"},
   {"action": "snapshot"},
   {"action": "assert", "text": "documentation"},
   {"action": "rotate"},
+  {"action": "wait_for", "condition": "window.innerWidth===915"},
   {"action": "network"},
   {"action": "perf"},
-  {"action": "device", "device": "desktop"}
+  {"action": "device", "device": "desktop"},
+  {"action": "wait_for", "condition": "!navigator.userAgent.includes('Pixel')"}
 ]

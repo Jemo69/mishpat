@@ -79,13 +79,19 @@ DEVICES: dict[str, dict[str, Any]] = {
                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
                "Mobile/15E148 Safari/604.1"),
     },
+    # Desktop presets carry an explicit UA too: switching back from a phone
+    # must overwrite the mobile UA override (CDP has no "clear", only "set").
     "desktop": {
         "label": "Desktop", "width": 1280, "height": 900, "dpr": 1.0,
-        "mobile": False, "touch": False, "ua": "",
+        "mobile": False, "touch": False,
+        "ua": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
     },
     "desktop-hd": {
         "label": "Desktop HD", "width": 1920, "height": 1080, "dpr": 1.0,
-        "mobile": False, "touch": False, "ua": "",
+        "mobile": False, "touch": False,
+        "ua": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
     },
 }
 
@@ -136,13 +142,13 @@ class HeadlessBrowser:
         # A device preset overrides width/height with its CSS viewport.
         if device is not None and device not in DEVICES:
             raise ValueError(f"unknown device: {device!r} (try: {', '.join(DEVICES)})")
-        self._device = device or "desktop"
-        preset = DEVICES[self._device]
+        name = device or "desktop"
+        preset = DEVICES[name]
         self.width = preset["width"] if device else width
         self.height = preset["height"] if device else height
         # Live emulation state (CDP override); viewport()/rotate() mutate this.
         self._emulation: dict[str, Any] = {
-            "device": self._device,
+            "device": name,
             "width": self.width,
             "height": self.height,
             "dpr": preset["dpr"],
@@ -150,6 +156,9 @@ class HeadlessBrowser:
             "touch": preset["touch"],
             "ua": preset["ua"],
         }
+        # DevTools state that must survive an idle-reaper relaunch (C2).
+        self._throttle = "online"
+        self._theme: str = "none"
         self.shots_dir = Path(shots_dir)
         self.shots_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
@@ -287,6 +296,7 @@ class HeadlessBrowser:
             self.driver.set_page_load_timeout(self.timeout)
             self.driver.implicitly_wait(3)
             self._apply_emulation()  # device preset before first navigation
+            self._apply_net_state()  # reapply stored throttle/theme after relaunch
             self._touch()
             self._start_reaper()
         if url:
@@ -348,24 +358,34 @@ class HeadlessBrowser:
             d.execute_cdp_cmd("Emulation.setTouchEmulationEnabled", {"enabled": e["touch"]})
         except Exception:
             pass
-        if e["ua"]:
+        # Always set (never skip): every preset carries a UA so switching
+        # back to desktop overwrites a stale mobile UA (C1).
+        try:
+            d.execute_cdp_cmd("Emulation.setUserAgentOverride", {"userAgent": e["ua"]})
+        except Exception:
+            pass
+
+    def _apply_net_state(self) -> None:
+        """Reapply stored throttle/theme to a fresh driver. Lock held. Best-effort:
+        a relaunch must never fail because a CDP nicety did."""
+        d = self.driver
+        if d is None:
+            return
+        p = NETWORK_PRESETS.get(self._throttle, NETWORK_PRESETS["online"])
+        try:
+            d.execute_cdp_cmd("Network.enable", {})
+            d.execute_cdp_cmd("Network.emulateNetworkConditions", {
+                "offline": p["offline"], "latency": p["latency"],
+                "downloadThroughput": p["download"], "uploadThroughput": p["upload"],
+            })
+        except Exception:
+            pass
+        if self._theme != "none":
             try:
-                d.execute_cdp_cmd("Emulation.setUserAgentOverride", {"userAgent": e["ua"]})
+                d.execute_cdp_cmd("Emulation.setEmulatedMedia", {
+                    "features": [{"name": "prefers-color-scheme", "value": self._theme}]})
             except Exception:
                 pass
-
-    @_held
-    def devices(self) -> dict[str, Any]:
-        """List mobile/desktop presets. Switch with emulate()."""
-        self._require()
-        return {
-            "ok": True,
-            "current": dict(self._emulation),
-            "devices": {
-                name: {k: p[k] for k in ("label", "width", "height", "dpr", "mobile", "touch")}
-                for name, p in DEVICES.items()
-            },
-        }
 
     @_held
     def emulate(
@@ -377,7 +397,17 @@ class HeadlessBrowser:
         """See the site as a mobile device: viewport + DPR + touch + mobile UA.
 
         emulate("pixel-8") switches preset; width/height override just the dims
-        (keeps the current preset's touch/UA). emulate("desktop") resets."""
+        (keeps the current preset's touch/UA). emulate("desktop") resets.
+        Bare emulate() lists the presets (no browser launch needed)."""
+        if device is None and width is None and height is None:
+            return {
+                "ok": True,
+                "current": dict(self._emulation),
+                "devices": {
+                    name: {k: p[k] for k in ("label", "width", "height", "dpr", "mobile", "touch")}
+                    for name, p in DEVICES.items()
+                },
+            }
         d = self._require()
         if device is not None:
             if device not in DEVICES:
@@ -394,11 +424,13 @@ class HeadlessBrowser:
             self._emulation["height"] = int(height)
         self._emulation["device"] = device or self._emulation["device"]
         self.width, self.height = self._emulation["width"], self._emulation["height"]
-        self._apply_emulation()
         try:
+            # Window resize first: it can clear a CDP metrics override, so the
+            # override below must be the last writer.
             d.set_window_size(self.width, self.height)
         except Exception:
             pass
+        self._apply_emulation()
         return {"ok": True, "emulation": dict(self._emulation), "url": d.current_url}
 
     @_held
@@ -438,10 +470,14 @@ class HeadlessBrowser:
             method, p = msg.get("method", ""), msg.get("params", {})
             if method == "Network.requestWillBeSent":
                 rid = p.get("requestId", "")
+                url = p.get("request", {}).get("url", "")[:160]
                 if rid and rid not in reqs:
-                    reqs[rid] = {"url": p.get("request", {}).get("url", "")[:160],
+                    reqs[rid] = {"url": url,
                                  "status": None, "mime": "", "failed": False, "error": ""}
                     order.append(rid)
+                elif rid and url:
+                    # Redirect hop reuses the requestId: follow it to the final URL.
+                    reqs[rid]["url"] = url
             elif method == "Network.responseReceived":
                 rid = p.get("requestId", "")
                 if rid in reqs:
@@ -500,10 +536,14 @@ class HeadlessBrowser:
             d.execute_cdp_cmd("Network.enable", {})
         except Exception:
             pass
-        d.execute_cdp_cmd("Network.emulateNetworkConditions", {
-            "offline": p["offline"], "latency": p["latency"],
-            "downloadThroughput": p["download"], "uploadThroughput": p["upload"],
-        })
+        try:
+            d.execute_cdp_cmd("Network.emulateNetworkConditions", {
+                "offline": p["offline"], "latency": p["latency"],
+                "downloadThroughput": p["download"], "uploadThroughput": p["upload"],
+            })
+        except Exception as exc:
+            raise RuntimeError(f"throttle {preset!r} failed: {short_exc(exc)}")
+        self._throttle = preset  # relaunches reapply it (C2)
         return {"ok": True, "throttle": preset, **p}
 
     @_held
@@ -513,7 +553,11 @@ class HeadlessBrowser:
         if mode not in ("dark", "light", "none"):
             raise ValueError(f"unknown theme: {mode!r} (try: dark | light | none)")
         features = [] if mode == "none" else [{"name": "prefers-color-scheme", "value": mode}]
-        d.execute_cdp_cmd("Emulation.setEmulatedMedia", {"features": features})
+        try:
+            d.execute_cdp_cmd("Emulation.setEmulatedMedia", {"features": features})
+        except Exception as exc:
+            raise RuntimeError(f"theme {mode!r} failed: {short_exc(exc)}")
+        self._theme = mode  # relaunches reapply it (C2)
         return {"ok": True, "theme": mode}
 
     def _retry_once(self, fn: Callable[[], Any]) -> Any:
