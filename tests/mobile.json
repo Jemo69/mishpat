@@ -1,0 +1,11 @@
+[
+  {"action": "devices"},
+  {"action": "device", "device": "pixel-8"},
+  {"action": "goto", "url": "https://example.com"},
+  {"action": "snapshot"},
+  {"action": "assert", "text": "documentation"},
+  {"action": "rotate"},
+  {"action": "network"},
+  {"action": "perf"},
+  {"action": "device", "device": "desktop"}
+]

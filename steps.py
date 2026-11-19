@@ -12,7 +12,8 @@ from browser import HeadlessBrowser
 
 ACTIONS = (
     "goto snapshot click click_text type press scroll wait wait_for wait_idle "
-    "back forward reload dom console tabs tab js checkpoint restore screenshot assert"
+    "back forward reload dom console tabs tab js checkpoint restore screenshot assert "
+    "device devices viewport rotate network perf throttle theme"
 )
 
 # Signatures that the chromedriver connection itself is gone (crash/OOM-kill).
@@ -98,4 +99,21 @@ def do_step(b: HeadlessBrowser, s: dict[str, Any]) -> dict[str, Any]:
         return r
     if a == "snapshot":
         return b.snapshot()
+    if a == "device":
+        return b.emulate(s.get("device") or s.get("name") or s.get("text"),
+                          s.get("width"), s.get("height"))
+    if a == "devices":
+        return b.devices()
+    if a == "viewport":
+        return b.viewport(int(s["width"]), int(s["height"]))
+    if a == "rotate":
+        return b.rotate()
+    if a == "network":
+        return b.network(limit=int(s.get("limit", 30)))
+    if a == "perf":
+        return b.perf()
+    if a == "throttle":
+        return b.throttle(str(s.get("preset", s.get("text", "online"))))
+    if a == "theme":
+        return b.theme(str(s.get("mode", s.get("text", "dark"))))
     raise ValueError(f"unknown action: {a} (valid: {ACTIONS})")

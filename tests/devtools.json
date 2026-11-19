@@ -1,0 +1,10 @@
+[
+  {"action": "goto", "url": "https://example.com"},
+  {"action": "network"},
+  {"action": "perf"},
+  {"action": "console"},
+  {"action": "throttle", "preset": "slow-3g"},
+  {"action": "throttle", "preset": "online"},
+  {"action": "theme", "mode": "dark"},
+  {"action": "theme", "mode": "none"}
+]
